@@ -1,0 +1,21 @@
+{
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "train.py",
+    "config",
+    "db",
+    "training",
+    "scripts"
+  ],
+  "exclude": [
+    "models",
+    "checkpoints",
+    "logs",
+    ".venv"
+  ],
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false
+}

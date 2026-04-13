@@ -1,0 +1,20 @@
+# ── NLP / 模型训练 ─────────────────────────────────────────────
+sentence-transformers>=3.0
+datasets>=2.14
+accelerate>=1.1.0
+
+# CPU-only torch（无显卡时使用，减小安装体积）
+# 如果服务器有 NVIDIA 显卡，将下面一行替换为: torch>=2.3
+torch>=2.3 --index-url https://download.pytorch.org/whl/cpu
+
+# ── 数据库（只读库，严禁写入）──────────────────────────────────
+aiomysql==0.2.0
+PyMySQL==1.1.1
+
+# ── 配置 ───────────────────────────────────────────────────────
+pydantic>=2.10
+pydantic-settings>=2.5
+python-dotenv==1.0.1
+
+# ── 部署（SCP 上传到云端服务器）────────────────────────────────
+paramiko>=3.4

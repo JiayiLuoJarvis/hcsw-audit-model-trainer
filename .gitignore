@@ -1,0 +1,25 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 模型权重（体积大，不入库）
+models/base/
+models/finetuned/v*/
+
+# 训练状态（本地状态文件）
+checkpoints/training_checkpoint.json
+checkpoints/training_checkpoint.json.tmp
+
+# versions.json 是生成物，不入库
+models/finetuned/versions.json
+models/finetuned/versions.json.tmp
+
+# 日志
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
