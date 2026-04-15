@@ -63,6 +63,23 @@ def _normalize_anchor(
     return direction + currency_tag + money_tag + re.sub(r"\s+", " ", text).strip()
 
 
+def _sample_negative(
+    positive: str,
+    anchor: str,
+    same_dir_subjects: list[str],
+    all_subjects: list[str],
+) -> str | None:
+    """
+    优先从同方向科目中采样负例（收入 anchor → 收入科目为负例），
+    避免模型靠方向前缀轻松区分正负例，迫使其学习细粒度语义差异。
+    若同方向候选不足，则回退到全科目。
+    """
+    pool = [s for s in same_dir_subjects if s != positive]
+    if not pool:
+        pool = [s for s in all_subjects if s != positive]
+    return random.choice(pool) if pool else None
+
+
 def build_triplets(raw_pairs: list[dict]) -> list[TrainingTriplet]:
     """
     将原始流水记录转换为训练三元组（去重均衡后）。
@@ -71,7 +88,7 @@ def build_triplets(raw_pairs: list[dict]) -> list[TrainingTriplet]:
       1. 归一化 anchor
       2. 按科目精确去重
       3. 超 cap 随机截断
-      4. 随机采样负例
+      4. 同方向负例采样（收入科目负例来自收入类，支出同理）
     """
     cap = settings.MAX_SAMPLES_PER_SUBJECT
     subject_to_anchors: dict[str, dict[str, None]] = {}
@@ -92,6 +109,15 @@ def build_triplets(raw_pairs: list[dict]) -> list[TrainingTriplet]:
         logger.warning("科目种类不足（%d 种），无法构建负例", len(all_subjects))
         return []
 
+    # 建立方向 → 科目列表的索引（一个科目可同时出现在两个方向）
+    income_subjects: list[str] = []
+    expense_subjects: list[str] = []
+    for subject, anchor_dict in subject_to_anchors.items():
+        if any(a.startswith("[收入]") for a in anchor_dict):
+            income_subjects.append(subject)
+        if any(a.startswith("[支出]") for a in anchor_dict):
+            expense_subjects.append(subject)
+
     balanced_pairs: list[tuple[str, str]] = []
     for subject, anchor_dict in subject_to_anchors.items():
         anchors = list(anchor_dict.keys())
@@ -102,19 +128,20 @@ def build_triplets(raw_pairs: list[dict]) -> list[TrainingTriplet]:
 
     triplets: list[TrainingTriplet] = []
     for anchor, positive in balanced_pairs:
-        negatives = [s for s in all_subjects if s != positive]
-        if not negatives:
+        if anchor.startswith("[收入]"):
+            same_dir = income_subjects
+        elif anchor.startswith("[支出]"):
+            same_dir = expense_subjects
+        else:
+            same_dir = all_subjects
+        neg = _sample_negative(positive, anchor, same_dir, all_subjects)
+        if neg is None:
             continue
-        triplets.append(
-            TrainingTriplet(
-                anchor=anchor,
-                positive=positive,
-                negative=random.choice(negatives),
-            )
-        )
+        triplets.append(TrainingTriplet(anchor=anchor, positive=positive, negative=neg))
 
     logger.info(
-        "构建训练三元组 %d 条（科目种类 %d 种）", len(triplets), len(all_subjects)
+        "构建训练三元组 %d 条（科目种类 %d 种，收入侧 %d 种，支出侧 %d 种）",
+        len(triplets), len(all_subjects), len(income_subjects), len(expense_subjects),
     )
     return triplets
 
@@ -136,8 +163,15 @@ def build_train_val(
 
     train_triplets = build_triplets(train_raw)
 
-    # 验证集用全量科目建负例池，不去重
+    # 验证集用全量科目建负例池（同方向优先），不去重
     all_subjects = list({row["correct_subject"] for row in raw_pairs})
+    # 构建方向索引（基于 type 字段，1=收入 2=支出）
+    income_subjects_val = list({
+        row["correct_subject"] for row in raw_pairs if int(row.get("type") or 0) == 1
+    })
+    expense_subjects_val = list({
+        row["correct_subject"] for row in raw_pairs if int(row.get("type") or 0) == 2
+    })
     val_triplets: list[TrainingTriplet] = []
     for row in val_raw:
         summary = (row.get("summary") or "").strip()
@@ -149,16 +183,16 @@ def build_train_val(
         if not anchor:
             continue
         positive: str = row["correct_subject"]
-        negatives = [s for s in all_subjects if s != positive]
-        if not negatives:
+        if type_ == 1:
+            same_dir = income_subjects_val
+        elif type_ == 2:
+            same_dir = expense_subjects_val
+        else:
+            same_dir = all_subjects
+        neg = _sample_negative(positive, anchor, same_dir, all_subjects)
+        if neg is None:
             continue
-        val_triplets.append(
-            TrainingTriplet(
-                anchor=anchor,
-                positive=positive,
-                negative=random.choice(negatives),
-            )
-        )
+        val_triplets.append(TrainingTriplet(anchor=anchor, positive=positive, negative=neg))
 
     return train_triplets, val_triplets
 
