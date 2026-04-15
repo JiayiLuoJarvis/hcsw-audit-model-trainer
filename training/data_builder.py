@@ -28,6 +28,9 @@ from db.reader import fetch_raw_pairs
 logger = logging.getLogger(__name__)
 
 # ── 噪音过滤正则 ────────────────────────────────────────────────────────────────
+# ⚠️  同步要求：以下去噪逻辑必须与 subject-matcher 的 app/model.py 完全一致。
+#    修改任一侧后，另一侧也必须同步，并更新：
+#    hcsw-audit-subject-matcher/tests/test_normalize_anchor_sync.py
 # 中文公司名：匹配到公司类后缀为止，向前贪婪抓取汉字/字母/数字/括号/空格
 _RE_CN_COMPANY = re.compile(
     r"[\u4e00-\u9fa5A-Za-z0-9（）()·\s]{1,30}"
@@ -35,11 +38,14 @@ _RE_CN_COMPANY = re.compile(
     r"合伙企业|有限公司|集团公司|事务所|研究院|集团)"
 )
 # 英文公司名：匹配各类英文后缀（全词，不区分大小写）
+# re.ASCII：确保 \w / \b 仅对 ASCII 字符生效，
+# 否则 Python 默认 Unicode 模式下汉字也是 \w，导致汉字与英文之间无 \b，
+# 紧跟在中文公司名后的英文地名前缀（如 "Weifang"）会被漏过。
 _RE_EN_COMPANY = re.compile(
     r"\b[\w\s\-&\.]{1,40}?"
     r"(?:Co\.,?\s*Ltd\.?|Limited|Ltd\.?|Corp\.?|Corporation|Inc\.?|LLC|L\.L\.C\.?|"
     r"Holdings?|Group|Pte\.?\s*Ltd\.?)\b",
-    re.IGNORECASE,
+    re.IGNORECASE | re.ASCII,
 )
 # 纯数字串 ≥ 6 位（账号/流水号）
 _RE_LONG_NUM = re.compile(r"\b\d{6,}\b")
