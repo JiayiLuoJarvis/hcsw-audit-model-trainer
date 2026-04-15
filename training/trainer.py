@@ -180,7 +180,8 @@ def _run_one_batch(
     logger.info("基准准确率: %.4f", baseline_acc)
 
     examples = [InputExample(texts=[t.anchor, t.positive, t.negative]) for t in train_triplets]
-    loader = DataLoader(cast("Dataset[InputExample]", examples), shuffle=True, batch_size=128)
+    batch_size = 32
+    loader = DataLoader(cast("Dataset[InputExample]", examples), shuffle=True, batch_size=batch_size)
     loss_fn = losses.MultipleNegativesRankingLoss(model=model)
 
     logger.info(
