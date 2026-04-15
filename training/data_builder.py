@@ -3,13 +3,14 @@
 
 anchor   - [收入]/[支出] + [币种] + [金额档位] + 流水摘要（去噪）+ 交易类型
 positive - 正确科目名（account_chart.name）
-negative - 硬负例：从与 positive 语义最近的科目中随机选取（top 3~10）
+negative - 硬负例：从与 positive 语义最近的科目中随机选取（top-k）
 
 数据均衡策略：
   1. 文本归一化 + 噪音过滤（公司名→[对方单位]、数字/日期/单号删除）
-  2. 软去重（同科目相同 anchor 最多保留 MAX_DUPLICATES_PER_ANCHOR 份，每份搭配不同负例）
-  3. 超过 MAX_SAMPLES_PER_SUBJECT 则随机截断
-  4. 验证集保留原始频率分布，不去重不截断
+  2. 冲突标注过滤（同一归一化 anchor 指向多个科目时多数投票），在 train/val 切割前执行
+  3. 软去重（同科目相同 anchor 最多保留 MAX_DUPLICATES_PER_ANCHOR 份，每份无放回采样不同负例）
+  4. 超过 MAX_SAMPLES_PER_SUBJECT 则随机截断
+  5. 验证集按 anchor 去重（每个唯一 anchor 保留一条，防止高频科目虚高准确率）
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from db.reader import fetch_raw_pairs
 logger = logging.getLogger(__name__)
 
 
-def _get_latest_finetuned_path() -> str | None:
+def get_latest_finetuned_path() -> str | None:
     """返回最新 finetuned 版本的路径，若不存在则返回 None。"""
     base_dir = settings.FINETUNED_MODEL_DIR
     if not os.path.isdir(base_dir):
@@ -130,12 +131,13 @@ def _normalize_anchor(
 def _build_hard_negative_index(
     subjects: list[str],
     model_path: str,
-    top_k: int = 10,
+    top_k: int = 5,
 ) -> dict[str, list[str]]:
     """
-    用 BGE 模型预计算所有科目 embedding，
+    用指定模型预计算所有科目 embedding，
     为每个科目返回语义最近的 top_k 个错误科目列表（排除自身）。
-    负例从 top 3~top_k 中随机采样，避开 top-1（防止真正的近义科目被当负例）。
+    负例从 top-1 ~ top_k 中随机采样（包含 top-1，迫使模型区分最相近的科目）。
+    建议第一批用 base 模型计算，后续批次传入最新 finetuned 模型路径以保持索引新鲜度。
     """
     if len(subjects) < 2:
         return {}
@@ -149,7 +151,7 @@ def _build_hard_negative_index(
         # 按相似度降序排列，排除自身（i）
         ranked = np.argsort(sim_matrix[i])[::-1]
         candidates = [subjects[j] for j in ranked if j != i]
-        # 保留 top_k 个，实际采样时跳过 top-1（index 0 = 最近的）
+        # 保留 top_k 个（含 top-1），迫使模型学习区分最相近的科目
         index[subj] = candidates[:top_k]
     return index
 
@@ -185,7 +187,6 @@ def _get_negative_pool(
 
 def _sample_negative(
     positive: str,
-    anchor: str,
     same_dir_subjects: list[str],
     all_subjects: list[str],
     hard_index: dict[str, list[str]] | None = None,
@@ -193,6 +194,81 @@ def _sample_negative(
     """单次采样（验证集专用）。训练集请用 _get_negative_pool + random.sample。"""
     pool = _get_negative_pool(positive, same_dir_subjects, all_subjects, hard_index)
     return random.choice(pool) if pool else None
+
+
+def _filter_conflicting_anchors(raw_pairs: list[dict]) -> list[dict]:
+    """
+    全量数据上检测冲突标注（同一归一化 anchor 指向多个科目），
+    多数投票保留多数派行，丢弃少数派行。
+
+    必须在 train/val 切割之前调用，确保两侧均不受矛盾标注污染。
+    平局时取字典序最小的科目名（保证确定性），并记录 WARNING 提示人工审核。
+    """
+    # Step 1: 统计每个 (anchor, subject) 的出现次数
+    anchor_subj_cnt: dict[str, dict[str, int]] = {}
+    for row in raw_pairs:
+        summary = (row.get("summary") or "").strip()
+        trade_type = (row.get("trade_type") or "").strip()
+        type_ = int(row.get("type") or 0)
+        currency = (row.get("currency") or "").strip()
+        money = float(row.get("money") or 0.0)
+        anc = _normalize_anchor(summary, trade_type, type_, currency, money)
+        if not anc:
+            continue
+        subj: str = row["correct_subject"]
+        anchor_subj_cnt.setdefault(anc, {})
+        anchor_subj_cnt[anc][subj] = anchor_subj_cnt[anc].get(subj, 0) + 1
+
+    # Step 2: 找出所有冲突 anchor 的少数派 (anchor, subject)
+    losing: set[tuple[str, str]] = set()
+    for anc, subj_cnts in anchor_subj_cnt.items():
+        if len(subj_cnts) <= 1:
+            continue
+        max_cnt = max(subj_cnts.values())
+        winners = [s for s, c in subj_cnts.items() if c == max_cnt]
+        if len(winners) > 1:
+            # 平局：取字典序最小（确定性），提示人工审核
+            winner = min(winners)
+            logger.warning(
+                "冲突标注平局 anchor=%r 涉及科目 %s（各 %d 条）→ 自动选 %r，建议人工审核",
+                anc, winners, max_cnt, winner,
+            )
+        else:
+            winner = winners[0]
+            logger.warning(
+                "冲突标注 anchor=%r 共 %d 种科目（%s）→ 多数投票保留 %r(%d条)，丢弃其余",
+                anc, len(subj_cnts),
+                ", ".join(f"{s}:{c}" for s, c in subj_cnts.items()),
+                winner, max_cnt,
+            )
+        for subj in subj_cnts:
+            if subj != winner:
+                losing.add((anc, subj))
+
+    if not losing:
+        return raw_pairs
+
+    # Step 3: 过滤原始行
+    filtered: list[dict] = []
+    removed = 0
+    for row in raw_pairs:
+        summary = (row.get("summary") or "").strip()
+        trade_type = (row.get("trade_type") or "").strip()
+        type_ = int(row.get("type") or 0)
+        currency = (row.get("currency") or "").strip()
+        money = float(row.get("money") or 0.0)
+        anc = _normalize_anchor(summary, trade_type, type_, currency, money)
+        subj = row.get("correct_subject", "")
+        if anc and (anc, subj) in losing:
+            removed += 1
+        else:
+            filtered.append(row)
+
+    logger.info(
+        "冲突标注过滤：丢弃 %d 条少数派记录（%d → %d 条）",
+        removed, len(raw_pairs), len(filtered),
+    )
+    return filtered
 
 
 def build_triplets(
@@ -224,32 +300,6 @@ def build_triplets(
         anchor_counts = subject_to_anchors.setdefault(subject, {})
         if anchor_counts.get(anchor, 0) < dup_cap:
             anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
-
-    # ── Fix 3: 冲突标注检测 + 多数投票 ─────────────────────────────────────────
-    # 逆向建立 anchor -> {subject: count} 映射，找出同一 anchor 指向多个科目的情况
-    anchor_to_subj_cnt: dict[str, dict[str, int]] = {}
-    for subj, anchors_dict in subject_to_anchors.items():
-        for anc, cnt in anchors_dict.items():
-            anchor_to_subj_cnt.setdefault(anc, {})[subj] = cnt
-    conflict_removed = 0
-    for anc, subj_cnts in anchor_to_subj_cnt.items():
-        if len(subj_cnts) > 1:
-            # 多数投票：保留票数最多的科目，丢弃其余（票数相同时取字典序最小，保证确定性）
-            winner = max(subj_cnts, key=lambda s: (subj_cnts[s], s))
-            logger.warning(
-                "冲突标注 anchor=%r 共 %d 种科目（%s）→ 多数投票保留 %s(%d条)，丢弃其余",
-                anc, len(subj_cnts),
-                ", ".join(f"{s}:{c}" for s, c in subj_cnts.items()),
-                winner, subj_cnts[winner],
-            )
-            for subj in list(subj_cnts.keys()):
-                if subj != winner and anc in subject_to_anchors.get(subj, {}):
-                    del subject_to_anchors[subj][anc]
-                    conflict_removed += 1
-    # 清理因冲突过滤导致的空科目条目
-    subject_to_anchors = {s: ad for s, ad in subject_to_anchors.items() if ad}
-    if conflict_removed:
-        logger.info("冲突标注过滤：丢弃 %d 个少数派 (科目, anchor) 对", conflict_removed)
 
     all_subjects = list(subject_to_anchors.keys())
     if len(all_subjects) < 2:
@@ -310,25 +360,28 @@ def build_triplets(
 def build_train_val(
     raw_pairs: list[dict],
     val_ratio: float = 0.2,
+    index_model_path: str | None = None,
 ) -> tuple[list[TrainingTriplet], list[TrainingTriplet]]:
     """
     将原始流水记录切分为训练集和验证集。
 
     - 训练集：精确去重 + 均衡截断（消除高频科目垄断）
     - 验证集：仅归一化，保留原始频率分布（评估更贴近生产）
+    - index_model_path：用于计算硬负例索引的模型路径，
+      None 时使用 BASE_MODEL_PATH；传入最新 finetuned 路径可保持索引新鲜度。
     """
+    raw_pairs = _filter_conflicting_anchors(raw_pairs)
     random.shuffle(raw_pairs)
     val_size = max(1, int(len(raw_pairs) * val_ratio))
     val_raw = raw_pairs[:val_size]
     train_raw = raw_pairs[val_size:]
 
-    # 预计算硬负例索引（优先用最新 finetuned 模型，以便生成对当前模型更难的负例；无则 base）
+    # 预计算硬负例索引：优先用显式传入路径，其次自动探测最新 finetuned，最后回退 base
+    _latest_ft = get_latest_finetuned_path()
+    model_for_index = index_model_path or _latest_ft or settings.BASE_MODEL_PATH
     all_subjects_full = list({row["correct_subject"] for row in raw_pairs})
-    logger.info("预计算硬负例索引（共 %d 个科目）...", len(all_subjects_full))
-    _latest_ft = _get_latest_finetuned_path()
-    _hard_neg_model = _latest_ft if _latest_ft else settings.BASE_MODEL_PATH
-    logger.info("硬负例索引使用模型: %s", _hard_neg_model)
-    hard_index = _build_hard_negative_index(all_subjects_full, _hard_neg_model)
+    logger.info("预计算硬负例索引（共 %d 个科目，模型: %s）...", len(all_subjects_full), model_for_index)
+    hard_index = _build_hard_negative_index(all_subjects_full, model_for_index)
 
     train_triplets = build_triplets(train_raw, hard_index)
 
@@ -358,7 +411,7 @@ def build_train_val(
             same_dir = expense_subjects_val
         else:
             same_dir = all_subjects
-        neg = _sample_negative(positive, anchor, same_dir, all_subjects, hard_index)
+        neg = _sample_negative(positive, same_dir, all_subjects, hard_index)
         if neg is None:
             continue
         val_triplets.append(TrainingTriplet(anchor=anchor, positive=positive, negative=neg))
@@ -383,6 +436,7 @@ def build_train_val_from_db(
     limit: int = 50000,
     last_id: int = 0,
     val_ratio: float = 0.2,
+    index_model_path: str | None = None,
 ) -> tuple[list[TrainingTriplet], list[TrainingTriplet], list[int], int]:
     """
     从只读库拉取数据并构建训练集 / 验证集。
@@ -390,6 +444,7 @@ def build_train_val_from_db(
     Returns:
         (train_triplets, val_triplets, ids, new_last_id)
         new_last_id — 本批次最大流水 ID，写入 checkpoint 防重复训练
+    index_model_path — 用于计算硬负例索引的模型路径，None 时用 BASE_MODEL_PATH
     """
     if min_samples is None:
         min_samples = settings.MIN_TRAIN_SAMPLES
@@ -407,5 +462,5 @@ def build_train_val_from_db(
     ids: list[int] = [row["id"] for row in raw_pairs]
     new_last_id = max(ids) if ids else last_id
 
-    train_triplets, val_triplets = build_train_val(raw_pairs, val_ratio)
+    train_triplets, val_triplets = build_train_val(raw_pairs, val_ratio, index_model_path)
     return train_triplets, val_triplets, ids, new_last_id

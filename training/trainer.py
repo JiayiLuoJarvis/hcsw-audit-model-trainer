@@ -14,13 +14,11 @@ import time
 from datetime import datetime
 from math import ceil
 
-from typing import cast
-
-from sentence_transformers import InputExample, SentenceTransformer, losses
-from torch.utils.data import DataLoader, Dataset
+from datasets import Dataset as HFDataset
+from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer, SentenceTransformerTrainingArguments, losses
 
 from config.settings import settings
-from training.data_builder import TrainingTriplet, build_train_val_from_db
+from training.data_builder import TrainingTriplet, build_train_val_from_db, get_latest_finetuned_path
 from training.evaluator import evaluate
 
 logger = logging.getLogger(__name__)
@@ -106,16 +104,9 @@ def _record_version(
 
 
 def _latest_version() -> str | None:
-    base = settings.FINETUNED_MODEL_DIR
-    if not os.path.isdir(base):
-        return None
-    dirs = [
-        d for d in os.listdir(base)
-        if os.path.isdir(os.path.join(base, d)) and d.startswith("v") and d[1:].isdigit()
-    ]
-    if not dirs:
-        return None
-    return f"v{max(int(d[1:]) for d in dirs)}"
+    """返回最新 finetuned 版本号（如 "v3"），委托给 data_builder 的路径探测函数。"""
+    path = get_latest_finetuned_path()
+    return os.path.basename(path) if path else None
 
 
 def _next_version() -> str:
@@ -142,8 +133,18 @@ def _run_one_batch(
     """
     batch_start = time.time()
 
+    # 确定上一版 finetuned 路径，用于硬负例索引计算（保持索引新鲜度）
+    latest = _latest_version()
+    index_model_path = (
+        os.path.join(settings.FINETUNED_MODEL_DIR, latest)
+        if latest is not None
+        else settings.BASE_MODEL_PATH
+    )
+    logger.info("硬负例索引将使用模型: %s", index_model_path)
+
     train_triplets, val_triplets, ids, new_last_id = build_train_val_from_db(
-        min_samples=min_samples, limit=batch_limit, last_id=last_id
+        min_samples=min_samples, limit=batch_limit, last_id=last_id,
+        index_model_path=index_model_path,
     )
 
     if not train_triplets:
@@ -166,7 +167,6 @@ def _run_one_batch(
         "pending_since": datetime.now().isoformat(timespec="seconds"),
     })
 
-    latest = _latest_version()
     if latest is not None:
         base_path = os.path.join(settings.FINETUNED_MODEL_DIR, latest)
         logger.info("从最新 finetuned 版本 %s 开始训练: %s", latest, base_path)
@@ -179,29 +179,46 @@ def _run_one_batch(
     baseline_acc = evaluate(model, val_triplets)
     logger.info("基准准确率: %.4f", baseline_acc)
 
-    examples = [InputExample(texts=[t.anchor, t.positive, t.negative]) for t in train_triplets]
     batch_size = 32
-    loader = DataLoader(cast("Dataset[InputExample]", examples), shuffle=True, batch_size=batch_size)
+    num_steps_per_epoch = ceil(len(train_triplets) / batch_size)
+    train_dataset = HFDataset.from_dict({
+        "anchor":   [t.anchor   for t in train_triplets],
+        "positive": [t.positive for t in train_triplets],
+        "negative": [t.negative for t in train_triplets],
+    })
     # TripletLoss 直接约束 cos(anchor,pos) - cos(anchor,neg) >= margin，
     # 解决 MNRL 下正负例分数差过窄（如 0.779 vs 0.714）但不被惩罚的问题。
     # margin=0.15 要求正例比负例至少高 0.15，迫使模型拉开混淆对间距。
-    loss_fn = losses.TripletLoss(model=model, distance_metric=losses.TripletDistanceMetric.COSINE, triplet_margin=0.15)
+    loss_fn = losses.TripletLoss(
+        model=model,
+        distance_metric=losses.TripletDistanceMetric.COSINE,
+        triplet_margin=0.15,
+    )
+    train_args = SentenceTransformerTrainingArguments(
+        output_dir=os.path.join(_ROOT, "checkpoints", "trainer_tmp"),
+        num_train_epochs=2,
+        per_device_train_batch_size=batch_size,
+        warmup_steps=ceil(num_steps_per_epoch * 0.1),
+        learning_rate=2e-6,
+        fp16=False,
+        save_strategy="no",
+        logging_steps=max(1, num_steps_per_epoch // 5),
+    )
 
     logger.info(
         "开始 Fine-tune：%d 条样本 | batch_size=%d | %d steps/epoch x 2 epochs",
         len(train_triplets),
         batch_size,
-        len(loader),
+        num_steps_per_epoch,
     )
     fit_start = time.time()
 
-    model.fit(
-        train_objectives=[(loader, loss_fn)],
-        epochs=2,
-        warmup_steps=ceil(len(loader) * 0.1),
-        optimizer_params={"lr": 2e-6},
-        show_progress_bar=True,
-    )
+    SentenceTransformerTrainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_dataset,
+        loss=loss_fn,
+    ).train()
     fit_elapsed = time.time() - fit_start
     logger.info("Fine-tune 完成，用时 %.0f 秒（%.1f 分钟）", fit_elapsed, fit_elapsed / 60)
 
