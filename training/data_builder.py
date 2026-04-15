@@ -114,12 +114,13 @@ def _normalize_anchor(
 def _build_hard_negative_index(
     subjects: list[str],
     model_path: str,
-    top_k: int = 10,
+    top_k: int = 5,
 ) -> dict[str, list[str]]:
     """
-    用 BGE 模型预计算所有科目 embedding，
+    用指定模型预计算所有科目 embedding，
     为每个科目返回语义最近的 top_k 个错误科目列表（排除自身）。
-    负例从 top 3~top_k 中随机采样，避开 top-1（防止真正的近义科目被当负例）。
+    负例从 top-1 ~ top_k 中随机采样（包含 top-1，迫使模型区分最相近的科目）。
+    建议第一批用 base 模型计算，后续批次传入最新 finetuned 模型路径以保持索引新鲜度。
     """
     if len(subjects) < 2:
         return {}
@@ -133,7 +134,7 @@ def _build_hard_negative_index(
         # 按相似度降序排列，排除自身（i）
         ranked = np.argsort(sim_matrix[i])[::-1]
         candidates = [subjects[j] for j in ranked if j != i]
-        # 保留 top_k 个，实际采样时跳过 top-1（index 0 = 最近的）
+        # 保留 top_k 个（含 top-1），迫使模型学习区分最相近的科目
         index[subj] = candidates[:top_k]
     return index
 
@@ -146,13 +147,13 @@ def _sample_negative(
     hard_index: dict[str, list[str]] | None = None,
 ) -> str | None:
     """
-    硬负例采样（优先）：从与 positive 语义最近的 top 3~10 中随机选。
+    硬负例采样（优先）：从与 positive 语义最近的 top-1~5 中随机选，优先同方向。
     回退策略：同方向随机 → 全科目随机。
     """
     if hard_index and positive in hard_index:
         candidates = hard_index[positive]
-        # 跳过 top-1（最相似，可能是真近义），从 top-2 开始最多取到 top-10
-        pool = candidates[1:] if len(candidates) > 1 else candidates
+        # 使用全部 top-5（含 top-1），迫使模型区分最难的对
+        pool = candidates
         # 进一步限制在同方向科目内（若可用候选足够）
         same_dir_set = set(same_dir_subjects)
         dir_pool = [s for s in pool if s in same_dir_set and s != positive]
@@ -246,22 +247,26 @@ def build_triplets(
 def build_train_val(
     raw_pairs: list[dict],
     val_ratio: float = 0.2,
+    index_model_path: str | None = None,
 ) -> tuple[list[TrainingTriplet], list[TrainingTriplet]]:
     """
     将原始流水记录切分为训练集和验证集。
 
     - 训练集：精确去重 + 均衡截断（消除高频科目垄断）
     - 验证集：仅归一化，保留原始频率分布（评估更贴近生产）
+    - index_model_path：用于计算硬负例索引的模型路径，
+      None 时使用 BASE_MODEL_PATH；传入最新 finetuned 路径可保持索引新鲜度。
     """
     random.shuffle(raw_pairs)
     val_size = max(1, int(len(raw_pairs) * val_ratio))
     val_raw = raw_pairs[:val_size]
     train_raw = raw_pairs[val_size:]
 
-    # 预计算硬负例索引（用 base 模型，科目列表来自全量数据）
+    # 预计算硬负例索引：优先用传入的 finetuned 模型，否则回退到 base
+    model_for_index = index_model_path or settings.BASE_MODEL_PATH
     all_subjects_full = list({row["correct_subject"] for row in raw_pairs})
-    logger.info("预计算硬负例索引（共 %d 个科目）...", len(all_subjects_full))
-    hard_index = _build_hard_negative_index(all_subjects_full, settings.BASE_MODEL_PATH)
+    logger.info("预计算硬负例索引（共 %d 个科目，模型: %s）...", len(all_subjects_full), model_for_index)
+    hard_index = _build_hard_negative_index(all_subjects_full, model_for_index)
 
     train_triplets = build_triplets(train_raw, hard_index)
 
@@ -304,6 +309,7 @@ def build_train_val_from_db(
     limit: int = 50000,
     last_id: int = 0,
     val_ratio: float = 0.2,
+    index_model_path: str | None = None,
 ) -> tuple[list[TrainingTriplet], list[TrainingTriplet], list[int], int]:
     """
     从只读库拉取数据并构建训练集 / 验证集。
@@ -311,6 +317,7 @@ def build_train_val_from_db(
     Returns:
         (train_triplets, val_triplets, ids, new_last_id)
         new_last_id — 本批次最大流水 ID，写入 checkpoint 防重复训练
+    index_model_path — 用于计算硬负例索引的模型路径，None 时用 BASE_MODEL_PATH
     """
     if min_samples is None:
         min_samples = settings.MIN_TRAIN_SAMPLES
@@ -328,5 +335,5 @@ def build_train_val_from_db(
     ids: list[int] = [row["id"] for row in raw_pairs]
     new_last_id = max(ids) if ids else last_id
 
-    train_triplets, val_triplets = build_train_val(raw_pairs, val_ratio)
+    train_triplets, val_triplets = build_train_val(raw_pairs, val_ratio, index_model_path)
     return train_triplets, val_triplets, ids, new_last_id

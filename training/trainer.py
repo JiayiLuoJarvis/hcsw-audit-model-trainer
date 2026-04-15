@@ -142,8 +142,18 @@ def _run_one_batch(
     """
     batch_start = time.time()
 
+    # 确定上一版 finetuned 路径，用于硬负例索引计算（保持索引新鲜度）
+    latest = _latest_version()
+    index_model_path = (
+        os.path.join(settings.FINETUNED_MODEL_DIR, latest)
+        if latest is not None
+        else settings.BASE_MODEL_PATH
+    )
+    logger.info("硬负例索引将使用模型: %s", index_model_path)
+
     train_triplets, val_triplets, ids, new_last_id = build_train_val_from_db(
-        min_samples=min_samples, limit=batch_limit, last_id=last_id
+        min_samples=min_samples, limit=batch_limit, last_id=last_id,
+        index_model_path=index_model_path,
     )
 
     if not train_triplets:
@@ -166,7 +176,6 @@ def _run_one_batch(
         "pending_since": datetime.now().isoformat(timespec="seconds"),
     })
 
-    latest = _latest_version()
     if latest is not None:
         base_path = os.path.join(settings.FINETUNED_MODEL_DIR, latest)
         logger.info("从最新 finetuned 版本 %s 开始训练: %s", latest, base_path)
