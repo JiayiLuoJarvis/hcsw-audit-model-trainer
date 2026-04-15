@@ -63,6 +63,8 @@ python scripts/deploy.py
 # 上传指定版本
 python scripts/deploy.py --version v3
 
+source venv/bin/activate && python scripts/deploy.py
+
 # 上传后重启云端服务（需 .env 中配置 DEPLOY_SERVICE_NAME）
 python scripts/deploy.py --reload
 

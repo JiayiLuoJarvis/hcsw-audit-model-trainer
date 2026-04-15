@@ -184,8 +184,9 @@ def _run_one_batch(
     loss_fn = losses.MultipleNegativesRankingLoss(model=model)
 
     logger.info(
-        "开始 Fine-tune：%d 条样本 | batch_size=128 | %d steps/epoch x 2 epochs",
+        "开始 Fine-tune：%d 条样本 | batch_size=%d | %d steps/epoch x 2 epochs",
         len(train_triplets),
+        batch_size,
         len(loader),
     )
     fit_start = time.time()
