@@ -23,14 +23,14 @@ class Settings(BaseSettings):
     DB_PASSWORD: str = ""
 
     # ── 模型路径 ─────────────────────────────────────────────────
-    BASE_MODEL_PATH: str = os.path.join(_ROOT, "models", "base")
+    BASE_MODEL_PATH: str = os.path.join(_ROOT, "models", "base-m3")
     FINETUNED_MODEL_DIR: str = os.path.join(_ROOT, "models", "finetuned")
 
     # ── 训练参数 ─────────────────────────────────────────────────
     BATCH_LIMIT: int = 50000
     MIN_TRAIN_SAMPLES: int = 200
     MAX_SAMPLES_PER_SUBJECT: int = 500
-    MAX_DUPLICATES_PER_ANCHOR: int = 3
+    MAX_DUPLICATES_PER_ANCHOR: int = 5  # 从 3 提升到 5：短锚文本需更多重复样本以获得充分训练信号
 
     # ── 日志 ─────────────────────────────────────────────────────
     LOG_DIR: str = os.path.join(_ROOT, "logs")

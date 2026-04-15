@@ -182,7 +182,10 @@ def _run_one_batch(
     examples = [InputExample(texts=[t.anchor, t.positive, t.negative]) for t in train_triplets]
     batch_size = 32
     loader = DataLoader(cast("Dataset[InputExample]", examples), shuffle=True, batch_size=batch_size)
-    loss_fn = losses.MultipleNegativesRankingLoss(model=model)
+    # TripletLoss 直接约束 cos(anchor,pos) - cos(anchor,neg) >= margin，
+    # 解决 MNRL 下正负例分数差过窄（如 0.779 vs 0.714）但不被惩罚的问题。
+    # margin=0.15 要求正例比负例至少高 0.15，迫使模型拉开混淆对间距。
+    loss_fn = losses.TripletLoss(model=model, distance_metric=losses.TripletDistanceMetric.COSINE, triplet_margin=0.15)
 
     logger.info(
         "开始 Fine-tune：%d 条样本 | batch_size=%d | %d steps/epoch x 2 epochs",

@@ -15,6 +15,7 @@ negative - 硬负例：从与 positive 语义最近的科目中随机选取（to
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 from typing import NamedTuple
@@ -26,6 +27,21 @@ from config.settings import settings
 from db.reader import fetch_raw_pairs
 
 logger = logging.getLogger(__name__)
+
+
+def _get_latest_finetuned_path() -> str | None:
+    """返回最新 finetuned 版本的路径，若不存在则返回 None。"""
+    base_dir = settings.FINETUNED_MODEL_DIR
+    if not os.path.isdir(base_dir):
+        return None
+    dirs = [
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("v") and d[1:].isdigit()
+    ]
+    if not dirs:
+        return None
+    latest = f"v{max(int(d[1:]) for d in dirs)}"
+    return os.path.join(base_dir, latest)
 
 # ── 噪音过滤正则 ────────────────────────────────────────────────────────────────
 # ⚠️  同步要求：以下去噪逻辑必须与 subject-matcher 的 app/model.py 完全一致。
@@ -138,6 +154,35 @@ def _build_hard_negative_index(
     return index
 
 
+def _get_negative_pool(
+    positive: str,
+    same_dir_subjects: list[str],
+    all_subjects: list[str],
+    hard_index: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """
+    返回可用的负例候选池（已排除 positive 本身）。
+    优先：hard_index 同方向 → hard_index 全量 → 同方向随机 → 全科目随机。
+    """
+    if hard_index and positive in hard_index:
+        candidates = hard_index[positive]
+        # 直接从 top-k 中选，不跳过 top-1：
+        # top-1 往往就是最需要对比的混淆科目（如"应收董事款" vs "其他应付款-董事往来款"），
+        # 跳过它会导致最难混淆对从不进入训练。
+        pool = [s for s in candidates if s != positive]
+        same_dir_set = set(same_dir_subjects)
+        dir_pool = [s for s in pool if s in same_dir_set]
+        if dir_pool:
+            return dir_pool
+        if pool:
+            return pool
+    # 回退：同方向随机
+    pool = [s for s in same_dir_subjects if s != positive]
+    if not pool:
+        pool = [s for s in all_subjects if s != positive]
+    return pool
+
+
 def _sample_negative(
     positive: str,
     anchor: str,
@@ -145,26 +190,8 @@ def _sample_negative(
     all_subjects: list[str],
     hard_index: dict[str, list[str]] | None = None,
 ) -> str | None:
-    """
-    硬负例采样（优先）：从与 positive 语义最近的 top 3~10 中随机选。
-    回退策略：同方向随机 → 全科目随机。
-    """
-    if hard_index and positive in hard_index:
-        candidates = hard_index[positive]
-        # 跳过 top-1（最相似，可能是真近义），从 top-2 开始最多取到 top-10
-        pool = candidates[1:] if len(candidates) > 1 else candidates
-        # 进一步限制在同方向科目内（若可用候选足够）
-        same_dir_set = set(same_dir_subjects)
-        dir_pool = [s for s in pool if s in same_dir_set and s != positive]
-        if dir_pool:
-            return random.choice(dir_pool)
-        if pool:
-            return random.choice(pool)
-
-    # 回退：同方向随机
-    pool = [s for s in same_dir_subjects if s != positive]
-    if not pool:
-        pool = [s for s in all_subjects if s != positive]
+    """单次采样（验证集专用）。训练集请用 _get_negative_pool + random.sample。"""
+    pool = _get_negative_pool(positive, same_dir_subjects, all_subjects, hard_index)
     return random.choice(pool) if pool else None
 
 
@@ -198,6 +225,32 @@ def build_triplets(
         if anchor_counts.get(anchor, 0) < dup_cap:
             anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
 
+    # ── Fix 3: 冲突标注检测 + 多数投票 ─────────────────────────────────────────
+    # 逆向建立 anchor -> {subject: count} 映射，找出同一 anchor 指向多个科目的情况
+    anchor_to_subj_cnt: dict[str, dict[str, int]] = {}
+    for subj, anchors_dict in subject_to_anchors.items():
+        for anc, cnt in anchors_dict.items():
+            anchor_to_subj_cnt.setdefault(anc, {})[subj] = cnt
+    conflict_removed = 0
+    for anc, subj_cnts in anchor_to_subj_cnt.items():
+        if len(subj_cnts) > 1:
+            # 多数投票：保留票数最多的科目，丢弃其余（票数相同时取字典序最小，保证确定性）
+            winner = max(subj_cnts, key=lambda s: (subj_cnts[s], s))
+            logger.warning(
+                "冲突标注 anchor=%r 共 %d 种科目（%s）→ 多数投票保留 %s(%d条)，丢弃其余",
+                anc, len(subj_cnts),
+                ", ".join(f"{s}:{c}" for s, c in subj_cnts.items()),
+                winner, subj_cnts[winner],
+            )
+            for subj in list(subj_cnts.keys()):
+                if subj != winner and anc in subject_to_anchors.get(subj, {}):
+                    del subject_to_anchors[subj][anc]
+                    conflict_removed += 1
+    # 清理因冲突过滤导致的空科目条目
+    subject_to_anchors = {s: ad for s, ad in subject_to_anchors.items() if ad}
+    if conflict_removed:
+        logger.info("冲突标注过滤：丢弃 %d 个少数派 (科目, anchor) 对", conflict_removed)
+
     all_subjects = list(subject_to_anchors.keys())
     if len(all_subjects) < 2:
         logger.warning("科目种类不足（%d 种），无法构建负例", len(all_subjects))
@@ -212,29 +265,40 @@ def build_triplets(
         if any(a.startswith("[支出]") for a in anchor_dict):
             expense_subjects.append(subject)
 
-    balanced_pairs: list[tuple[str, str]] = []
+    # ── Fix 1: 展开后按 (anchor, subject) 分组，无放回采样负例 ─────────────────
+    pair_counts: dict[tuple[str, str], int] = {}
     for subject, anchor_counts in subject_to_anchors.items():
         # 展开：每个 anchor 按其 count 重复，再整体截断到 cap
-        anchors: list[str] = []
+        anchors_flat: list[str] = []
         for anchor, cnt in anchor_counts.items():
-            anchors.extend([anchor] * cnt)
-        if cap > 0 and len(anchors) > cap:
-            anchors = random.sample(anchors, cap)
-        for anchor in anchors:
-            balanced_pairs.append((anchor, subject))
+            anchors_flat.extend([anchor] * cnt)
+        if cap > 0 and len(anchors_flat) > cap:
+            anchors_flat = random.sample(anchors_flat, cap)
+        for anchor in anchors_flat:
+            key = (anchor, subject)
+            pair_counts[key] = pair_counts.get(key, 0) + 1
 
     triplets: list[TrainingTriplet] = []
-    for anchor, positive in balanced_pairs:
+    for (anchor, positive), cnt in pair_counts.items():
         if anchor.startswith("[收入]"):
             same_dir = income_subjects
         elif anchor.startswith("[支出]"):
             same_dir = expense_subjects
         else:
             same_dir = all_subjects
-        neg = _sample_negative(positive, anchor, same_dir, all_subjects, hard_index)
-        if neg is None:
+        neg_pool = _get_negative_pool(positive, same_dir, all_subjects, hard_index)
+        if not neg_pool:
             continue
-        triplets.append(TrainingTriplet(anchor=anchor, positive=positive, negative=neg))
+        # 无放回采样：保证同一 (anchor, positive) 的 cnt 份使用不同负例；
+        # 当候选池不足时，补充有放回采样
+        if len(neg_pool) >= cnt:
+            negs = random.sample(neg_pool, cnt)
+        else:
+            negs = list(neg_pool) + [
+                random.choice(neg_pool) for _ in range(cnt - len(neg_pool))
+            ]
+        for neg in negs:
+            triplets.append(TrainingTriplet(anchor=anchor, positive=positive, negative=neg))
 
     logger.info(
         "构建训练三元组 %d 条（科目种类 %d 种，收入侧 %d 种，支出侧 %d 种）",
@@ -258,10 +322,13 @@ def build_train_val(
     val_raw = raw_pairs[:val_size]
     train_raw = raw_pairs[val_size:]
 
-    # 预计算硬负例索引（用 base 模型，科目列表来自全量数据）
+    # 预计算硬负例索引（优先用最新 finetuned 模型，以便生成对当前模型更难的负例；无则 base）
     all_subjects_full = list({row["correct_subject"] for row in raw_pairs})
     logger.info("预计算硬负例索引（共 %d 个科目）...", len(all_subjects_full))
-    hard_index = _build_hard_negative_index(all_subjects_full, settings.BASE_MODEL_PATH)
+    _latest_ft = _get_latest_finetuned_path()
+    _hard_neg_model = _latest_ft if _latest_ft else settings.BASE_MODEL_PATH
+    logger.info("硬负例索引使用模型: %s", _hard_neg_model)
+    hard_index = _build_hard_negative_index(all_subjects_full, _hard_neg_model)
 
     train_triplets = build_triplets(train_raw, hard_index)
 
@@ -295,6 +362,18 @@ def build_train_val(
         if neg is None:
             continue
         val_triplets.append(TrainingTriplet(anchor=anchor, positive=positive, negative=neg))
+
+    # ── Fix 2: 验证集按 anchor 去重 ──────────────────────────────────────────────
+    # 同一 anchor 只保留第一条，防止高频科目的重复 anchor 虚高准确率。
+    # 目标：验证集衡量「不同类型描述的识别能力」，而不是「高频描述被反复答对」。
+    seen_val_anchors: set[str] = set()
+    deduped_val: list[TrainingTriplet] = []
+    for t in val_triplets:
+        if t.anchor not in seen_val_anchors:
+            deduped_val.append(t)
+            seen_val_anchors.add(t.anchor)
+    logger.info("验证集去重：%d → %d 条（唯一 anchor）", len(val_triplets), len(deduped_val))
+    val_triplets = deduped_val
 
     return train_triplets, val_triplets
 

@@ -57,22 +57,46 @@ copy .env.example .env
 
 ---
 
-## 4. 放置基础预训练模型
+## 4. 下载基础预训练模型（bge-m3）
 
-将 BGE 模型文件夹复制或软链接到 `models/base/`（对应 `.env` 中的 `BASE_MODEL_PATH`）。
+基础模型为 `BAAI/bge-m3`，需下载到 `models/base-m3/`（约 2.3 GB）。
 
-**从原项目复制（推荐）：**
+**方式一：自动下载（需训练机能访问 HuggingFace）**
 
 ```powershell
-# 将 bge-base-zh-v1.5 复制过来
-Copy-Item -Recurse ..\hcsw-audit-banl-statement\models\bge-base-zh-v1.5 .\models\base
+python -c "
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer('BAAI/bge-m3')
+m.save('models/base-m3')
+print('下载完成')
+"
 ```
 
-**或指定绝对路径（无需复制）：**
+**方式二：手动复制（内网离线场景）**
+
+在能访问 HuggingFace 的机器上执行方式一下载，再将整个 `models/base-m3/` 目录拷贝到训练机对应路径。
+
+**方式三：指定已有模型的绝对路径（无需复制）**
 
 在 `.env` 中设置：
 ```ini
-BASE_MODEL_PATH=E:\project\hcsw-audit\hcsw-audit-bank-statement\hcsw-audit-banl-statement\models\bge-base-zh-v1.5
+BASE_MODEL_PATH=/data/models/bge-m3
+```
+
+> `BASE_MODEL_PATH` 默认值为 `models/base-m3`，在 `config/settings.py` 中定义，可通过 `.env` 覆盖。
+
+---
+
+## 4.1 重置 Checkpoint（首次全量训练前必做）
+
+首次部署或切换基础模型后，须重置 checkpoint 以清除历史状态，从头全量训练：
+
+```powershell
+# 方式一：直接覆盖写入（推荐）
+'{"last_id": 0}' | Out-File -Encoding utf8 checkpoints\training_checkpoint.json
+
+# 方式二：通过 --from-id 参数跳过 checkpoint（等效）
+python train.py --from-id 0 --force
 ```
 
 ---
