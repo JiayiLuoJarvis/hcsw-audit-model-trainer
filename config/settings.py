@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     BATCH_LIMIT: int = 50000
     MIN_TRAIN_SAMPLES: int = 200
     MAX_SAMPLES_PER_SUBJECT: int = 500
+    MAX_DUPLICATES_PER_ANCHOR: int = 3
 
     # ── 日志 ─────────────────────────────────────────────────────
     LOG_DIR: str = os.path.join(_ROOT, "logs")

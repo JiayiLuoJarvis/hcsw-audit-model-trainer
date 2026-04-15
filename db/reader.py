@@ -43,18 +43,23 @@ async def _fetch_raw_pairs_async(limit: int, last_id: int = 0) -> list[dict]:
             await cur.execute(
                 """
                 SELECT
-                    bas.id          AS id,
-                    bas.type        AS type,
-                    bas.money       AS money,
-                    ba.currency     AS currency,
-                    bas.summary     AS summary,
-                    bas.trade_type  AS trade_type,
-                    ac.name         AS correct_subject
+                    bas.id              AS id,
+                    bas.type            AS type,
+                    bas.money           AS money,
+                    ba.currency         AS currency,
+                    bas.summary         AS summary,
+                    bas.trade_type      AS trade_type,
+                    ac.name             AS leaf_name,
+                    ac.level            AS subject_level,
+                    parent_ac.name      AS parent_name
                 FROM bank_account_statement bas
                 INNER JOIN account_chart ac
                     ON ac.id = bas.account_chart_id
                     AND ac.is_deleted = 0
                     AND ac.company_id = 0
+                LEFT JOIN account_chart parent_ac
+                    ON parent_ac.id = ac.parent_id
+                    AND parent_ac.is_deleted = 0
                 INNER JOIN bank_account ba
                     ON ba.id = bas.bank_account_id
                     AND ba.is_deleted = 0
@@ -69,6 +74,12 @@ async def _fetch_raw_pairs_async(limit: int, last_id: int = 0) -> list[dict]:
                 (last_id, limit),
             )
             rows = await cur.fetchall()
+        # 构建 correct_subject：level <= 2 只用叶节点名，否则拼 "父级 - 叶节点"
+        for row in rows:
+            level = int(row.get("subject_level") or 0)
+            leaf: str = row["leaf_name"]
+            parent: str = (row.get("parent_name") or "").strip()
+            row["correct_subject"] = leaf if level <= 2 or not parent else f"{parent} - {leaf}"
         logger.info(
             "从只读库读取流水 %d 条（含科目标注），起始 ID: %d",
             len(rows),
